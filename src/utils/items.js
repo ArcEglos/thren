@@ -1,4 +1,11 @@
-import { ITEM_CATALOG } from '../data/catalog.js';
+import { ITEM_CATALOG, FLOW_GROUPS } from '../data/catalog.js';
+import { CELL_SIZE, HEX_SIZE } from '../constants.js';
+import {
+  generateHexGrid,
+  isHexInSolidRegion,
+  growHexCluster,
+  findBestTilingConfig
+} from './hex.js';
 
 // Helper to pick a random item from catalog
 export function pickRandomItem(options = {}) {
@@ -252,6 +259,9 @@ export function generateInventoryItem() {
     hollowCellColors = result.hollowCellColors;
   }
 
+  // Generate hex grid infrastructure on solid cells
+  const hexData = generateItemHexGrid(cells, width, height);
+
   return {
     id: Math.random().toString(36).substr(2, 9),
     name: catalogItem.name,
@@ -262,6 +272,102 @@ export function generateInventoryItem() {
     hollowCellColors: hollowCellColors,
     width,
     height,
-    groups: catalogItem.groups
+    groups: catalogItem.groups,
+    // Hex grid data
+    hexSlots: hexData.hexSlots,
+    hexRotation: hexData.hexRotation,
+    tilingOffset: hexData.tilingOffset,
+    ports: hexData.ports,
+    externalEdges: hexData.externalEdges
   };
+}
+
+// Generate hex grid infrastructure for an item's solid cells
+// Returns empty hex slots (no flow lines/syllables) ready for tile placement
+function generateItemHexGrid(solidCells, width, height) {
+  if (solidCells.length === 0) {
+    return { hexSlots: [], hexRotation: 0, tilingOffset: { x: 0, y: 0 }, ports: [], externalEdges: [] };
+  }
+
+  // Estimate capacity and find best tiling configuration
+  const solidCount = solidCells.length;
+  const estimatedCapacity = solidCount * 5;
+  const maxHexSlots = Math.max(3, Math.round(estimatedCapacity * 0.85));
+
+  const bestConfig = findBestTilingConfig(solidCells, width, height, maxHexSlots, 15);
+  const { tilingOffset, hexRotation } = bestConfig;
+
+  // Generate hex grid and filter to solid region
+  const allHexagons = generateHexGrid(
+    width * CELL_SIZE,
+    height * CELL_SIZE,
+    HEX_SIZE,
+    tilingOffset.x,
+    tilingOffset.y,
+    hexRotation
+  );
+
+  const cellSet = new Set(solidCells.map(c => `${c.x},${c.y}`));
+  const validHexes = allHexagons.filter(hex => isHexInSolidRegion(hex, solidCells, cellSet));
+  const hexSlots = growHexCluster(validHexes, HEX_SIZE, maxHexSlots);
+
+  // Find external edges (edges without neighbors)
+  const externalEdges = findHexExternalEdges(hexSlots, HEX_SIZE, hexRotation);
+
+  // Generate ports on 40-55% of external edges
+  const numPorts = Math.max(3, Math.floor(externalEdges.length * (0.40 + Math.random() * 0.15)));
+  const shuffledExternalEdges = [...externalEdges].sort(() => Math.random() - 0.5);
+  const ports = shuffledExternalEdges.slice(0, numPorts);
+
+  // Add empty slot data to each hex (ready for tile placement)
+  const slotsWithData = hexSlots.map((hex, idx) => ({
+    ...hex,
+    slotIndex: idx,
+    tile: null,  // No tile placed yet
+    // Precompute which edges are external and which have ports
+    externalEdges: externalEdges.filter(e => e.hexIdx === idx).map(e => e.edge),
+    portEdges: ports.filter(p => p.hexIdx === idx).map(p => p.edge)
+  }));
+
+  return {
+    hexSlots: slotsWithData,
+    hexRotation,
+    tilingOffset,
+    ports,
+    externalEdges
+  };
+}
+
+// Find external edges of hex cluster (edges without neighbors)
+function findHexExternalEdges(hexSlots, hexSize, hexRotation) {
+  const externalEdges = [];
+  const rotRad = (hexRotation * Math.PI) / 180;
+
+  for (let i = 0; i < hexSlots.length; i++) {
+    const hex = hexSlots[i];
+
+    for (let edge = 0; edge < 6; edge++) {
+      // Calculate direction to neighbor for this edge
+      const edgeAngle = (Math.PI / 3) * edge + rotRad + Math.PI / 6;
+      const neighborDist = hexSize * Math.sqrt(3);
+      const expectedNeighborX = hex.center.x + neighborDist * Math.cos(edgeAngle);
+      const expectedNeighborY = hex.center.y + neighborDist * Math.sin(edgeAngle);
+
+      // Check if there's a hex at this position
+      const hasNeighbor = hexSlots.some((other, j) => {
+        if (i === j) return false;
+        const dist = Math.sqrt(
+          Math.pow(other.center.x - expectedNeighborX, 2) +
+          Math.pow(other.center.y - expectedNeighborY, 2)
+        );
+        return dist < hexSize * 0.5;
+      });
+
+      if (!hasNeighbor) {
+        externalEdges.push({ hexIdx: i, edge, hex });
+      }
+    }
+  }
+
+  return externalEdges;
 }

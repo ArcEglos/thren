@@ -1,7 +1,9 @@
-import React, { useState, useCallback, useMemo } from 'react';
-import { INVENTORY_CELL_SIZE } from '../constants.js';
+import React, { useState, useCallback, useMemo, useReducer } from 'react';
+import { INVENTORY_CELL_SIZE, CELL_SIZE, HEX_SIZE } from '../constants.js';
 import { FLOW_GROUPS } from '../data/catalog.js';
+import { hexToPath, createHexagon, createInnerHexagon } from '../utils/hex.js';
 import { generateInventoryItem } from '../utils/items.js';
+import { generateRandomTile, getRotatedFlowLines, getRotatedEdgeColors } from '../utils/tiles.js';
 import {
   rotateItemCells,
   getRotatedDimensions,
@@ -14,6 +16,90 @@ import {
   unrotatedToRotated,
   getContainerBounds
 } from '../utils/inventory.js';
+
+// Action mode reducer for investigating/studying/extracting items
+const initialActionState = {
+  mode: 'idle',  // 'idle' | 'investigating' | 'studying' | 'extracting'
+  targetItemId: null,
+  drawnTiles: [],  // Tiles in hand during action
+  selectedTileId: null,  // Which tile from hand is selected
+};
+
+function actionReducer(state, action) {
+  switch (action.type) {
+    case 'START_INVESTIGATING':
+      return {
+        mode: 'investigating',
+        targetItemId: action.itemId,
+        drawnTiles: [],
+        selectedTileId: null,
+      };
+
+    case 'START_STUDYING':
+      return {
+        mode: 'studying',
+        targetItemId: action.itemId,
+        drawnTiles: [],
+        selectedTileId: null,
+      };
+
+    case 'START_EXTRACTING':
+      return {
+        mode: 'extracting',
+        targetItemId: action.itemId,
+        drawnTiles: [],
+        selectedTileId: null,
+      };
+
+    case 'DRAW_TILE':
+      return {
+        ...state,
+        drawnTiles: [...state.drawnTiles, action.tile],
+      };
+
+    case 'SELECT_TILE':
+      return {
+        ...state,
+        selectedTileId: action.tileId,
+      };
+
+    case 'DESELECT_TILE':
+      return {
+        ...state,
+        selectedTileId: null,
+      };
+
+    case 'ROTATE_TILE':
+      return {
+        ...state,
+        drawnTiles: state.drawnTiles.map(t =>
+          t.id === action.tileId
+            ? { ...t, rotation: ((t.rotation || 0) + 1) % 6 }
+            : t
+        ),
+      };
+
+    case 'REMOVE_TILE_FROM_HAND':
+      return {
+        ...state,
+        drawnTiles: state.drawnTiles.filter(t => t.id !== action.tileId),
+        selectedTileId: state.selectedTileId === action.tileId ? null : state.selectedTileId,
+      };
+
+    case 'ADD_TILE_TO_HAND':
+      return {
+        ...state,
+        drawnTiles: [...state.drawnTiles, action.tile],
+      };
+
+    case 'FINISH':
+    case 'ABANDON':
+      return initialActionState;
+
+    default:
+      return state;
+  }
+}
 
 function InventoryMode() {
   const [gridSize] = useState({ width: 10, height: 7 });
@@ -37,12 +123,378 @@ function InventoryMode() {
   // Container hover state - when hovering over a container's hollow cell
   // { containerId, localPosition: {x, y} } or null
   const [containerHover, setContainerHover] = useState(null);
-  
+
+  // Hex slot hover state
+  const [hoveredSlot, setHoveredSlot] = useState(null);    // { itemId, slotIndex }
+
+  // Item hover state (for showing action buttons)
+  const [hoveredItemId, setHoveredItemId] = useState(null);
+
+  // Error/feedback message state
+  const [actionError, setActionError] = useState(null);  // { message: string, type: 'error' | 'warning' }
+
+  // Syllable inventory - collected from extracted tiles
+  const [syllableInventory, setSyllableInventory] = useState([]);
+
+  // Action mode state (investigating, studying, extracting)
+  const [actionState, dispatch] = useReducer(actionReducer, initialActionState);
+  const { mode: actionMode, targetItemId, drawnTiles, selectedTileId } = actionState;
+  const isInActionMode = actionMode !== 'idle';
+
+  // Get the selected tile object from drawnTiles
+  const selectedTile = useMemo(() =>
+    drawnTiles.find(t => t.id === selectedTileId) || null,
+    [drawnTiles, selectedTileId]
+  );
+
+  // Get the target item (the one being investigated/studied/extracted)
+  const targetItem = useMemo(() =>
+    placedItems.find(p => p.id === targetItemId) || null,
+    [placedItems, targetItemId]
+  );
+
   // Generate more items
   const addMoreItems = useCallback(() => {
     const newItems = Array.from({ length: 4 }, () => generateInventoryItem()).filter(Boolean);
     setAvailableItems(prev => [...prev, ...newItems]);
   }, []);
+
+  // Draw a tile during action mode (uses target item's groups)
+  const drawTile = useCallback(() => {
+    if (!isInActionMode || !targetItem) return;
+
+    // Clear any error when taking action
+    setActionError(null);
+
+    // Use the target item's groups for tile generation
+    const groups = targetItem.item.groups || Object.keys(FLOW_GROUPS);
+    const tile = generateRandomTile(groups);
+    dispatch({ type: 'DRAW_TILE', tile });
+  }, [isInActionMode, targetItem]);
+
+  // Select a tile from hand
+  const selectTileFromHand = useCallback((tile) => {
+    if (selectedTileId === tile.id) {
+      // Already selected - rotate it
+      dispatch({ type: 'ROTATE_TILE', tileId: tile.id });
+    } else {
+      dispatch({ type: 'SELECT_TILE', tileId: tile.id });
+    }
+  }, [selectedTileId]);
+
+  // Start investigating an uninvestigated item
+  const startInvestigating = useCallback((placedItemId) => {
+    dispatch({ type: 'START_INVESTIGATING', itemId: placedItemId });
+  }, []);
+
+  // Start studying an investigated item (must have empty slots)
+  const startStudying = useCallback((placedItemId) => {
+    dispatch({ type: 'START_STUDYING', itemId: placedItemId });
+  }, []);
+
+  // Check if an item has empty hex slots
+  const getEmptySlotCount = useCallback((item) => {
+    const hexSlots = item.hexSlots || [];
+    const placedTiles = item.placedTiles || {};
+    return hexSlots.filter((_, idx) => !placedTiles[idx]).length;
+  }, []);
+
+  // Check if an item has tiles with syllables (for extraction)
+  const hasSyllableTiles = useCallback((item) => {
+    const placedTiles = item.placedTiles || {};
+    return Object.values(placedTiles).some(tile =>
+      tile && !tile.isFlipped && tile.syllables && tile.syllables.length > 0
+    );
+  }, []);
+
+  // Start extracting from an investigated item
+  const startExtracting = useCallback((placedItemId) => {
+    dispatch({ type: 'START_EXTRACTING', itemId: placedItemId });
+  }, []);
+
+  // Flip a tile for extraction - collects syllables immediately
+  const flipTileForExtraction = useCallback((itemId, slotIndex) => {
+    if (actionMode !== 'extracting') return;
+    if (itemId !== targetItemId) return;
+
+    const placedItem = placedItems.find(p => p.id === itemId);
+    if (!placedItem) return;
+
+    const tile = placedItem.item.placedTiles?.[slotIndex];
+    if (!tile || tile.isFlipped) return;
+    if (!tile.syllables || tile.syllables.length === 0) return;
+
+    // Collect syllables immediately
+    setSyllableInventory(prev => [...prev, ...tile.syllables]);
+
+    // Flip the tile (preserve original state, clear flow lines)
+    setPlacedItems(prev => prev.map(p => {
+      if (p.id !== itemId) return p;
+      return {
+        ...p,
+        item: {
+          ...p.item,
+          placedTiles: {
+            ...p.item.placedTiles,
+            [slotIndex]: {
+              ...tile,
+              isFlipped: true,
+              originalState: {
+                flowLines: tile.flowLines,
+                syllables: tile.syllables,
+                edgeColors: tile.edgeColors
+              },
+              // Flipped tile has no flow lines
+              flowLines: [],
+              syllables: [],
+              edgeColors: {}
+            }
+          }
+        }
+      };
+    }));
+
+    setActionError(null);
+  }, [actionMode, targetItemId, placedItems]);
+
+  // Abandon current action (destroys item and tiles)
+  const abandonAction = useCallback(() => {
+    if (!isInActionMode || !targetItemId) return;
+
+    // Remove the target item from placed items
+    setPlacedItems(prev => prev.filter(p => p.id !== targetItemId));
+
+    // Clear error and reset action state
+    setActionError(null);
+    dispatch({ type: 'ABANDON' });
+  }, [isInActionMode, targetItemId]);
+
+  // Validate that all flow lines are closed
+  // Returns { valid: boolean, errors: string[] }
+  const validateFlowLines = useCallback(() => {
+    if (!targetItem) return { valid: false, errors: ['No target item'] };
+
+    const item = targetItem.item;
+    const hexSlots = item.hexSlots || [];
+    const placedTiles = item.placedTiles || {};
+    const hexRotation = item.hexRotation || 0;
+    const errors = [];
+
+    // Build a map of slot index -> edge colors (after rotation)
+    const slotEdgeColors = {};
+    for (let slotIdx = 0; slotIdx < hexSlots.length; slotIdx++) {
+      const tile = placedTiles[slotIdx];
+      if (tile) {
+        slotEdgeColors[slotIdx] = getRotatedEdgeColors(tile.edgeColors, tile.rotation || 0);
+      } else {
+        slotEdgeColors[slotIdx] = {};  // Empty slot
+      }
+    }
+
+    // Build neighbor map for each slot
+    const rotRad = (hexRotation * Math.PI) / 180;
+    const neighborMap = {};  // slotIdx -> { edge: neighborSlotIdx }
+
+    for (let i = 0; i < hexSlots.length; i++) {
+      neighborMap[i] = {};
+      const slot = hexSlots[i];
+
+      for (let edge = 0; edge < 6; edge++) {
+        // Calculate expected neighbor position
+        const edgeAngle = (Math.PI / 3) * edge + rotRad + Math.PI / 6;
+        const neighborDist = HEX_SIZE * Math.sqrt(3);
+        const expectedX = slot.center.x + neighborDist * Math.cos(edgeAngle);
+        const expectedY = slot.center.y + neighborDist * Math.sin(edgeAngle);
+
+        // Find neighbor at this position
+        for (let j = 0; j < hexSlots.length; j++) {
+          if (i === j) continue;
+          const other = hexSlots[j];
+          const dist = Math.sqrt(
+            Math.pow(other.center.x - expectedX, 2) +
+            Math.pow(other.center.y - expectedY, 2)
+          );
+          if (dist < HEX_SIZE * 0.5) {
+            neighborMap[i][edge] = j;
+            break;
+          }
+        }
+      }
+    }
+
+    // Check each slot's flow line endpoints
+    for (let slotIdx = 0; slotIdx < hexSlots.length; slotIdx++) {
+      const slot = hexSlots[slotIdx];
+      const edgeColors = slotEdgeColors[slotIdx];
+      const portEdges = new Set(slot.portEdges || []);
+
+      for (const [edgeStr, group] of Object.entries(edgeColors)) {
+        const edge = parseInt(edgeStr);
+        const neighborSlotIdx = neighborMap[slotIdx][edge];
+
+        if (neighborSlotIdx !== undefined) {
+          // Has a neighbor - check if neighbor has something on the opposite edge
+          const oppositeEdge = (edge + 3) % 6;
+          const neighborEdgeColors = slotEdgeColors[neighborSlotIdx];
+          const neighborHasLine = neighborEdgeColors[oppositeEdge] !== undefined;
+
+          if (!neighborHasLine) {
+            errors.push(`Slot ${slotIdx + 1}: ${group} line on edge ${edge} connects to empty slot`);
+          }
+          // Note: colors don't have to match, just need something there
+        } else {
+          // External edge - must have a port
+          if (!portEdges.has(edge)) {
+            errors.push(`Slot ${slotIdx + 1}: ${group} line on edge ${edge} has no port (flow leak!)`);
+          }
+        }
+      }
+    }
+
+    return { valid: errors.length === 0, errors };
+  }, [targetItem]);
+
+  // Finish current action (validates and completes)
+  const finishAction = useCallback(() => {
+    if (!isInActionMode || !targetItemId) return;
+
+    // Clear any previous error
+    setActionError(null);
+
+    // Check that all drawn tiles are placed
+    if (drawnTiles.length > 0) {
+      setActionError({
+        message: `You must place all drawn tiles! (${drawnTiles.length} remaining in hand)`,
+        type: 'warning'
+      });
+      return;
+    }
+
+    // Validate flow lines
+    const { valid, errors } = validateFlowLines();
+    if (!valid) {
+      setActionError({
+        message: `Flow lines not closed: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? ` (+${errors.length - 3} more)` : ''}`,
+        type: 'error'
+      });
+      return;
+    }
+
+    // Mark item as investigated
+    setPlacedItems(prev => prev.map(p => {
+      if (p.id !== targetItemId) return p;
+      return {
+        ...p,
+        item: {
+          ...p.item,
+          investigated: true
+        }
+      };
+    }));
+
+    // Reset action state
+    dispatch({ type: 'FINISH' });
+  }, [isInActionMode, targetItemId, drawnTiles, validateFlowLines]);
+
+  // Place tile in a hex slot (only works on target item during action mode)
+  const placeTileInSlot = useCallback((itemId, slotIndex) => {
+    if (!selectedTile || !isInActionMode) return;
+    if (itemId !== targetItemId) return;  // Can only place on target item
+
+    // Find the placed item
+    const placedItem = placedItems.find(p => p.id === itemId);
+    if (!placedItem) return;
+
+    // Get the tile with current rotation from hand
+    const tileFromHand = drawnTiles.find(t => t.id === selectedTile.id);
+    if (!tileFromHand) return;
+
+    // Check if slot already has a tile
+    const existingTile = placedItem.item.placedTiles?.[slotIndex];
+    if (existingTile) {
+      // Pick up existing tile and put back in hand
+      dispatch({ type: 'ADD_TILE_TO_HAND', tile: existingTile });
+    }
+
+    // Update the item with the placed tile
+    setPlacedItems(prev => prev.map(p => {
+      if (p.id !== itemId) return p;
+      return {
+        ...p,
+        item: {
+          ...p.item,
+          placedTiles: {
+            ...(p.item.placedTiles || {}),
+            [slotIndex]: {
+              ...tileFromHand,
+              rotation: tileFromHand.rotation || 0
+            }
+          }
+        }
+      };
+    }));
+
+    // Remove tile from hand
+    dispatch({ type: 'REMOVE_TILE_FROM_HAND', tileId: selectedTile.id });
+  }, [selectedTile, isInActionMode, targetItemId, placedItems, drawnTiles]);
+
+  // Pick up a placed tile back to hand (only works on target item during action mode)
+  const pickUpTileFromSlot = useCallback((itemId, slotIndex) => {
+    if (!isInActionMode) return;
+    if (itemId !== targetItemId) return;  // Can only pick up from target item
+
+    const placedItem = placedItems.find(p => p.id === itemId);
+    if (!placedItem) return;
+
+    const tile = placedItem.item.placedTiles?.[slotIndex];
+    if (!tile) return;
+
+    // Add tile back to hand
+    dispatch({ type: 'ADD_TILE_TO_HAND', tile });
+
+    // Remove tile from item
+    setPlacedItems(prev => prev.map(p => {
+      if (p.id !== itemId) return p;
+      const newPlacedTiles = { ...p.item.placedTiles };
+      delete newPlacedTiles[slotIndex];
+      return {
+        ...p,
+        item: {
+          ...p.item,
+          placedTiles: newPlacedTiles
+        }
+      };
+    }));
+  }, [isInActionMode, targetItemId, placedItems]);
+
+  // Handle hex slot click
+  const handleHexSlotClick = useCallback((e, itemId, slotIndex) => {
+    e.stopPropagation();
+
+    // Only allow interaction with target item during action mode
+    if (!isInActionMode) return;
+    if (itemId !== targetItemId) return;
+
+    const placedItem = placedItems.find(p => p.id === itemId);
+    if (!placedItem) return;
+
+    const existingTile = placedItem.item.placedTiles?.[slotIndex];
+
+    // Extraction mode: clicking a syllable tile flips it
+    if (actionMode === 'extracting' && existingTile && !existingTile.isFlipped &&
+        existingTile.syllables && existingTile.syllables.length > 0) {
+      flipTileForExtraction(itemId, slotIndex);
+      return;
+    }
+
+    if (selectedTile) {
+      // Place selected tile
+      placeTileInSlot(itemId, slotIndex);
+    } else if (existingTile && !existingTile.isFlipped) {
+      // Pick up existing tile (can't pick up flipped tiles)
+      pickUpTileFromSlot(itemId, slotIndex);
+    }
+  }, [selectedTile, isInActionMode, targetItemId, actionMode, placedItems, placeTileInSlot, pickUpTileFromSlot, flipTileForExtraction]);
   
   // Select an item from stash
   const selectFromStash = useCallback((item) => {
@@ -67,21 +519,30 @@ function InventoryMode() {
     }
   }, [selectedItem]);
   
-  // Keyboard handler for rotation
+  // Keyboard handler for rotation and cancel
   React.useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'r' || e.key === 'R') {
-        rotateSelected();
+        if (selectedTile) {
+          // Rotate selected tile in hand
+          dispatch({ type: 'ROTATE_TILE', tileId: selectedTile.id });
+        } else if (selectedItem) {
+          rotateSelected();
+        }
       } else if (e.key === 'Escape') {
-        setSelectedItem(null);
-        setIsMovingPlaced(false);
-        setSelectedRotation(0);
+        if (selectedTile) {
+          dispatch({ type: 'DESELECT_TILE' });
+        } else if (selectedItem) {
+          setSelectedItem(null);
+          setIsMovingPlaced(false);
+          setSelectedRotation(0);
+        }
       }
     };
-    
+
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [rotateSelected]);
+  }, [rotateSelected, selectedTile, selectedItem]);
   
   // Get rotated cells for the selected item
   const getSelectedCells = useCallback(() => {
@@ -123,15 +584,19 @@ function InventoryMode() {
             : p
         ));
       } else {
-        // Place new item from stash
+        // Place new item from stash and auto-start investigating
+        const newItemId = Math.random().toString(36).substr(2, 9);
         setPlacedItems(prev => [...prev, {
-          id: Math.random().toString(36).substr(2, 9),
+          id: newItemId,
           item: selectedItem,
           position,
           rotation: selectedRotation,
           containedIn: null
         }]);
         setAvailableItems(prev => prev.filter(i => i.id !== selectedItem.id));
+
+        // Auto-start investigation for newly placed items
+        dispatch({ type: 'START_INVESTIGATING', itemId: newItemId });
       }
       setSelectedItem(null);
       setIsMovingPlaced(false);
@@ -265,37 +730,189 @@ function InventoryMode() {
         <h1 className="text-2xl font-bold text-stone-800 mb-2">
           Inventory System
         </h1>
-        <p className="text-stone-600 text-sm mb-4">
-          Click items to select, click grid to place. Press R to rotate. Click placed items to move them.
-        </p>
-        
-        <div className="flex gap-2 flex-wrap mb-4">
-          <button
-            onClick={addMoreItems}
-            className="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 transition-colors"
-          >
-            + Add Items
-          </button>
-          {selectedItem && (
-            <>
-              <button
-                onClick={rotateSelected}
-                className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
-              >
-                ↻ Rotate (R)
-              </button>
-              <button
-                onClick={cancelSelection}
-                className="px-4 py-2 bg-stone-500 text-white rounded hover:bg-stone-600 transition-colors"
-              >
-                Cancel (Esc)
-              </button>
-              <span className="px-3 py-2 text-stone-600 text-sm">
-                {selectedRotation * 90}°
-              </span>
-            </>
-          )}
-        </div>
+
+        {/* Action Mode Header */}
+        {isInActionMode && targetItem && (
+          <div className="mb-4 p-4 bg-amber-50 border-2 border-amber-400 rounded-lg">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <span className="text-amber-800 font-semibold text-lg">
+                  {actionMode === 'investigating' && '🔍 Investigating: '}
+                  {actionMode === 'studying' && '📚 Studying: '}
+                  {actionMode === 'extracting' && '⚗️ Extracting: '}
+                </span>
+                <span className="text-amber-900 font-bold">{targetItem.item.name}</span>
+                <span className="text-amber-700 ml-2 text-sm">
+                  ({targetItem.item.hexSlots?.length || 0} slots, groups: {targetItem.item.groups?.join(', ') || 'none'})
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={drawTile}
+                  className="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 transition-colors"
+                >
+                  🎴 Draw Tile
+                </button>
+                <button
+                  onClick={finishAction}
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                >
+                  ✓ Finish
+                </button>
+                <button
+                  onClick={abandonAction}
+                  className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition-colors"
+                >
+                  ✕ Abandon
+                </button>
+              </div>
+            </div>
+
+            {/* Hand display */}
+            <div className="flex items-center gap-2">
+              <span className="text-amber-800 text-sm font-medium">Hand ({drawnTiles.length}):</span>
+              {drawnTiles.length === 0 ? (
+                <span className="text-amber-600 text-sm italic">Draw tiles to begin</span>
+              ) : (
+                <div className="flex gap-2">
+                  {drawnTiles.map(tile => {
+                    const isSelected = selectedTileId === tile.id;
+                    const tileRotation = tile.rotation || 0;
+                    const rotatedFlowLines = getRotatedFlowLines(tile.flowLines, tileRotation);
+
+                    return (
+                      <div
+                        key={tile.id}
+                        onClick={() => selectTileFromHand(tile)}
+                        className={`cursor-pointer transition-all rounded ${
+                          isSelected
+                            ? 'ring-2 ring-purple-500 ring-offset-1 bg-purple-50'
+                            : 'hover:scale-105'
+                        }`}
+                        style={{ width: HEX_SIZE * 2, height: HEX_SIZE * 2 }}
+                        title={isSelected ? 'Click again to rotate' : 'Click to select'}
+                      >
+                        <svg width={HEX_SIZE * 2} height={HEX_SIZE * 2}>
+                          <g transform={`translate(${HEX_SIZE}, ${HEX_SIZE})`}>
+                            <path
+                              d={hexToPath(createHexagon(0, 0, HEX_SIZE * 0.85, 0))}
+                              fill="hsl(45, 25%, 88%)"
+                              stroke={isSelected ? '#9333ea' : 'hsl(45, 30%, 70%)'}
+                              strokeWidth={isSelected ? 2 : 1}
+                            />
+                            {rotatedFlowLines.map((flow, flowIdx) => {
+                              const scale = 0.85;
+                              const getEdgePoint = (edgeIdx) => {
+                                const angle1 = (Math.PI / 3) * edgeIdx;
+                                const angle2 = (Math.PI / 3) * ((edgeIdx + 1) % 6);
+                                return {
+                                  x: (HEX_SIZE * scale * (Math.cos(angle1) + Math.cos(angle2))) / 2,
+                                  y: (HEX_SIZE * scale * (Math.sin(angle1) + Math.sin(angle2))) / 2
+                                };
+                              };
+
+                              if (flow.isJunction && flow.edges) {
+                                return (
+                                  <g key={flowIdx}>
+                                    {flow.edges.map((edge, eIdx) => {
+                                      const p = getEdgePoint(edge);
+                                      return <line key={eIdx} x1={p.x} y1={p.y} x2={0} y2={0} stroke={flow.color} strokeWidth="3" strokeLinecap="round" />;
+                                    })}
+                                    <circle cx={0} cy={0} r="3" fill={flow.color} />
+                                  </g>
+                                );
+                              }
+
+                              const p1 = getEdgePoint(flow.edge1);
+                              if (flow.edge2 === null) {
+                                return (
+                                  <g key={flowIdx}>
+                                    <line x1={p1.x} y1={p1.y} x2={0} y2={0} stroke={flow.color} strokeWidth="3" strokeLinecap="round" />
+                                    <circle cx={0} cy={0} r="2" fill={flow.color} />
+                                  </g>
+                                );
+                              }
+
+                              const p2 = getEdgePoint(flow.edge2);
+                              return <path key={flowIdx} d={`M ${p1.x} ${p1.y} Q 0 0 ${p2.x} ${p2.y}`} fill="none" stroke={flow.color} strokeWidth="3" strokeLinecap="round" />;
+                            })}
+
+                            {tile.syllables?.length > 0 && (
+                              <g>
+                                <path d={hexToPath(createHexagon(0, 0, HEX_SIZE * 0.3, 0))} fill="hsl(45, 30%, 35%)" stroke="hsl(45, 35%, 45%)" strokeWidth="1" />
+                                <text x={0} y={0} textAnchor="middle" dominantBaseline="central" fontSize="8" fontWeight="bold" fill="#e8e4de">
+                                  {tile.syllables[0].syllable.symbol}
+                                </text>
+                              </g>
+                            )}
+                          </g>
+                        </svg>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {selectedTile && (
+                <span className="text-purple-600 text-sm ml-2">Click hex slot to place</span>
+              )}
+            </div>
+
+            {/* Error/warning message */}
+            {actionError && (
+              <div className={`mt-2 p-2 rounded text-sm ${
+                actionError.type === 'error'
+                  ? 'bg-red-100 text-red-800 border border-red-300'
+                  : 'bg-amber-100 text-amber-800 border border-amber-300'
+              }`}>
+                {actionError.type === 'error' ? '❌ ' : '⚠️ '}
+                {actionError.message}
+                <button
+                  onClick={() => setActionError(null)}
+                  className="ml-2 text-stone-500 hover:text-stone-700"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Normal mode header */}
+        {!isInActionMode && (
+          <p className="text-stone-600 text-sm mb-4">
+            Click items to select, click grid to place. Press R to rotate. Click uninvestigated items to investigate.
+          </p>
+        )}
+
+        {!isInActionMode && (
+          <div className="flex gap-2 flex-wrap mb-4">
+            <button
+              onClick={addMoreItems}
+              className="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 transition-colors"
+            >
+              + Add Items
+            </button>
+            {selectedItem && (
+              <>
+                <button
+                  onClick={rotateSelected}
+                  className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                >
+                  ↻ Rotate (R)
+                </button>
+                <button
+                  onClick={cancelSelection}
+                  className="px-4 py-2 bg-stone-500 text-white rounded hover:bg-stone-600 transition-colors"
+                >
+                  Cancel (Esc)
+                </button>
+                <span className="px-3 py-2 text-stone-600 text-sm">
+                  {selectedRotation * 90}°
+                </span>
+              </>
+            )}
+          </div>
+        )}
       </div>
       
       <div className="flex flex-col lg:flex-row gap-8">
@@ -352,8 +969,23 @@ function InventoryMode() {
 
               // Different styling for contained items (depth > 0)
               const isContained = depth > 0;
-              const solidBg = isContained ? '#e8e4de' : '#f5f2ed';
-              const solidBorder = isContained ? '#6b6560' : '#8b8680';
+              const isInvestigated = matItem.item.investigated === true;
+              const isTargetItem = targetItemId === matItem.id;
+
+              // Styling based on state
+              let solidBg = isContained ? '#e8e4de' : '#f5f2ed';
+              let solidBorder = isContained ? '#6b6560' : '#8b8680';
+
+              // Uninvestigated items get a different look
+              if (!isInvestigated && !isContained) {
+                solidBg = '#ede9e0';  // Slightly more muted
+                solidBorder = '#9c8c7c';  // Warmer border
+              }
+
+              // Target item during action gets highlighted
+              if (isTargetItem && isInActionMode) {
+                solidBorder = '#d97706';  // Amber border
+              }
 
               // Find top-left solid cell for label
               const minY = Math.min(...rotatedCells.map(c => c.y));
@@ -395,10 +1027,19 @@ function InventoryMode() {
                         boxSizing: 'border-box',
                         zIndex: depth
                       }}
+                      onMouseEnter={() => !isInActionMode && setHoveredItemId(matItem.id)}
+                      onMouseLeave={() => setHoveredItemId(null)}
                       onClick={(e) => {
                         e.stopPropagation();
+
+                        // During action mode, ignore clicks on non-target items
+                        if (isInActionMode && !isTargetItem) return;
+
                         if (selectedItem && selectedItem.id !== matItem.id) {
                           handleGridClick(absolutePosition.x + cell.x, absolutePosition.y + cell.y);
+                        } else if (!isInActionMode && !isContained && !isInvestigated) {
+                          // Click uninvestigated item to start investigating
+                          startInvestigating(matItem.id);
                         } else if (!isContained) {
                           selectPlacedItem(matItem);
                         } else {
@@ -454,6 +1095,8 @@ function InventoryMode() {
                           boxSizing: 'border-box',
                           zIndex: depth
                         }}
+                        onMouseEnter={() => !isInActionMode && setHoveredItemId(matItem.id)}
+                        onMouseLeave={() => setHoveredItemId(null)}
                         onClick={(e) => {
                           e.stopPropagation();
                           if (selectedItem && selectedItem.id !== matItem.id) {
@@ -501,17 +1144,333 @@ function InventoryMode() {
                     ))
                   )}
 
+                  {/* Hex grid overlay with interactive slots and placed tiles */}
+                  {matItem.item.hexSlots && matItem.item.hexSlots.length > 0 && (() => {
+                    const scale = INVENTORY_CELL_SIZE / CELL_SIZE;
+                    const origW = matItem.item.width * CELL_SIZE;
+                    const origH = matItem.item.height * CELL_SIZE;
+                    const itemRot = absoluteRotation || 0;
+                    const rotDeg = itemRot * 90;
+
+                    // Rotated dimensions (for SVG sizing)
+                    const isSwapped = itemRot === 1 || itemRot === 3;
+                    const rotW = isSwapped ? origH : origW;
+                    const rotH = isSwapped ? origW : origH;
+
+                    // SVG transform: rotate around center, then translate to keep origin at top-left
+                    let tx = 0, ty = 0;
+                    if (itemRot === 1) { tx = origH; ty = 0; }
+                    else if (itemRot === 2) { tx = origW; ty = origH; }
+                    else if (itemRot === 3) { tx = 0; ty = origW; }
+
+                    const hexRotation = matItem.item.hexRotation || 0;
+                    const rotRad = (hexRotation * Math.PI) / 180;
+                    const placedTiles = matItem.item.placedTiles || {};
+                    const arcaneHue = 45;
+
+                    // Helper to get edge midpoint
+                    const getEdgePoint = (center, edgeIdx) => {
+                      const angle1 = (Math.PI / 3) * edgeIdx + rotRad;
+                      const angle2 = (Math.PI / 3) * ((edgeIdx + 1) % 6) + rotRad;
+                      const c1x = center.x + HEX_SIZE * Math.cos(angle1);
+                      const c1y = center.y + HEX_SIZE * Math.sin(angle1);
+                      const c2x = center.x + HEX_SIZE * Math.cos(angle2);
+                      const c2y = center.y + HEX_SIZE * Math.sin(angle2);
+                      return { x: (c1x + c2x) / 2, y: (c1y + c2y) / 2 };
+                    };
+
+                    return (
+                      <svg
+                        className="absolute"
+                        style={{
+                          left: absolutePosition.x * INVENTORY_CELL_SIZE,
+                          top: absolutePosition.y * INVENTORY_CELL_SIZE,
+                          width: rotW,
+                          height: rotH,
+                          zIndex: (depth + 1) * 10,
+                          overflow: 'visible',
+                          transform: `scale(${scale})`,
+                          transformOrigin: '0 0',
+                          pointerEvents: 'none'
+                        }}
+                      >
+                        {/* Rotate entire hex content as a group */}
+                        <g transform={`translate(${tx}, ${ty}) rotate(${rotDeg})`}>
+                          {matItem.item.hexSlots.map((slot, slotIdx) => {
+                            const placedTile = placedTiles[slotIdx];
+                            const isSlotHovered = hoveredSlot?.itemId === matItem.id && hoveredSlot?.slotIndex === slotIdx;
+                            const hasSelectedTile = !!selectedTile;
+                            const isFlipped = placedTile?.isFlipped;
+
+                            // Slots are only interactive during action mode on target item
+                            const isInteractive = isTargetItem && isInActionMode;
+                            const showHoverEffect = isInteractive && isSlotHovered && hasSelectedTile;
+
+                            // In extraction mode, show hover effect on syllable tiles
+                            const canExtract = actionMode === 'extracting' && placedTile && !isFlipped &&
+                                              placedTile.syllables && placedTile.syllables.length > 0;
+                            const showExtractHover = isInteractive && isSlotHovered && canExtract;
+
+                            // Get rotated flow lines if tile is placed (and not flipped)
+                            const rotatedFlowLines = (placedTile && !isFlipped)
+                              ? getRotatedFlowLines(placedTile.flowLines, placedTile.rotation || 0)
+                              : [];
+
+                            // Determine fill color
+                            let slotFill;
+                            if (isFlipped) {
+                              slotFill = 'hsl(0, 0%, 75%)';  // Gray for flipped
+                            } else if (placedTile) {
+                              slotFill = `hsl(${arcaneHue}, 25%, 88%)`;
+                            } else if (showHoverEffect) {
+                              slotFill = 'rgba(147, 51, 234, 0.15)';
+                            } else if (showExtractHover) {
+                              slotFill = 'rgba(147, 51, 234, 0.2)';
+                            } else {
+                              slotFill = 'rgba(0,0,0,0.02)';
+                            }
+
+                            return (
+                              <g key={slotIdx}>
+                                {/* Clickable hex slot */}
+                                <path
+                                  d={hexToPath(slot.points)}
+                                  fill={slotFill}
+                                  stroke={showHoverEffect || showExtractHover ? '#9333ea' : (isTargetItem && isInActionMode ? '#d97706' : '#bbb')}
+                                  strokeWidth={showHoverEffect || showExtractHover ? 2 : 1}
+                                  strokeDasharray={placedTile && !isFlipped ? 'none' : '3,2'}
+                                  style={{
+                                    pointerEvents: isInteractive ? 'auto' : 'none',
+                                    cursor: isInteractive && (hasSelectedTile || placedTile) ? 'pointer' : 'default'
+                                  }}
+                                  onClick={(e) => handleHexSlotClick(e, matItem.id, slotIdx)}
+                                  onMouseEnter={() => setHoveredSlot({ itemId: matItem.id, slotIndex: slotIdx })}
+                                  onMouseLeave={() => setHoveredSlot(null)}
+                                />
+
+                                {/* Port markers on external edges */}
+                                {slot.portEdges?.map((edge) => {
+                                  const angle1 = (Math.PI / 3) * edge + rotRad;
+                                  const angle2 = (Math.PI / 3) * ((edge + 1) % 6) + rotRad;
+                                  const c1x = slot.center.x + HEX_SIZE * Math.cos(angle1);
+                                  const c1y = slot.center.y + HEX_SIZE * Math.sin(angle1);
+                                  const c2x = slot.center.x + HEX_SIZE * Math.cos(angle2);
+                                  const c2y = slot.center.y + HEX_SIZE * Math.sin(angle2);
+                                  const midX = (c1x + c2x) / 2;
+                                  const midY = (c1y + c2y) / 2;
+                                  const outAngle = (Math.PI / 3) * edge + rotRad + Math.PI / 6;
+                                  const portX = midX + 6 * Math.cos(outAngle);
+                                  const portY = midY + 6 * Math.sin(outAngle);
+
+                                  return (
+                                    <g key={`port-${edge}`}>
+                                      <line
+                                        x1={midX} y1={midY}
+                                        x2={portX} y2={portY}
+                                        stroke="#666"
+                                        strokeWidth={1.5}
+                                      />
+                                      <circle
+                                        cx={portX + 3 * Math.cos(outAngle)}
+                                        cy={portY + 3 * Math.sin(outAngle)}
+                                        r={3}
+                                        fill="#666"
+                                      />
+                                    </g>
+                                  );
+                                })}
+
+                                {/* Render placed tile flow lines */}
+                                {placedTile && rotatedFlowLines.map((flow, flowIdx) => {
+                                  // Multi-way junction
+                                  if (flow.isJunction && flow.edges) {
+                                    return (
+                                      <g key={flowIdx}>
+                                        {flow.edges.map((edge, eIdx) => {
+                                          const p = getEdgePoint(slot.center, edge);
+                                          return (
+                                            <line
+                                              key={eIdx}
+                                              x1={p.x} y1={p.y}
+                                              x2={slot.center.x} y2={slot.center.y}
+                                              stroke={flow.color}
+                                              strokeWidth="6"
+                                              strokeLinecap="round"
+                                            />
+                                          );
+                                        })}
+                                        <circle cx={slot.center.x} cy={slot.center.y} r="6" fill={flow.color} />
+                                      </g>
+                                    );
+                                  }
+
+                                  const p1 = getEdgePoint(slot.center, flow.edge1);
+
+                                  // Dead end
+                                  if (flow.edge2 === null) {
+                                    return (
+                                      <g key={flowIdx}>
+                                        <line
+                                          x1={p1.x} y1={p1.y}
+                                          x2={slot.center.x} y2={slot.center.y}
+                                          stroke={flow.color}
+                                          strokeWidth="6"
+                                          strokeLinecap="round"
+                                        />
+                                        <circle cx={slot.center.x} cy={slot.center.y} r="5" fill={flow.color} />
+                                      </g>
+                                    );
+                                  }
+
+                                  // 2-way flow line
+                                  const p2 = getEdgePoint(slot.center, flow.edge2);
+                                  return (
+                                    <path
+                                      key={flowIdx}
+                                      d={`M ${p1.x} ${p1.y} Q ${slot.center.x} ${slot.center.y} ${p2.x} ${p2.y}`}
+                                      fill="none"
+                                      stroke={flow.color}
+                                      strokeWidth="6"
+                                      strokeLinecap="round"
+                                    />
+                                  );
+                                })}
+
+                                {/* Flipped tile indicator */}
+                                {isFlipped && (
+                                  <g>
+                                    <path
+                                      d={hexToPath(createInnerHexagon(slot.center.x, slot.center.y, HEX_SIZE, hexRotation, 0.35))}
+                                      fill="hsl(0, 0%, 60%)"
+                                      stroke="hsl(0, 0%, 50%)"
+                                      strokeWidth="1"
+                                      strokeDasharray="2,2"
+                                    />
+                                    <text
+                                      x={slot.center.x}
+                                      y={slot.center.y}
+                                      textAnchor="middle"
+                                      dominantBaseline="central"
+                                      fontSize="10"
+                                      fill="#666"
+                                    >
+                                      ∅
+                                    </text>
+                                  </g>
+                                )}
+
+                                {/* Render syllables in placed tiles */}
+                                {placedTile && !isFlipped && placedTile.syllables && placedTile.syllables.length > 0 && (
+                                  <g>
+                                    <path
+                                      d={hexToPath(createInnerHexagon(slot.center.x, slot.center.y, HEX_SIZE, hexRotation, 0.38))}
+                                      fill={`hsl(${arcaneHue}, 30%, 35%)`}
+                                      stroke={`hsl(${arcaneHue}, 35%, 45%)`}
+                                      strokeWidth="1.5"
+                                    />
+                                    {placedTile.syllables.length === 1 ? (
+                                      <text
+                                        x={slot.center.x}
+                                        y={slot.center.y}
+                                        textAnchor="middle"
+                                        dominantBaseline="central"
+                                        fontSize="12"
+                                        fontWeight="bold"
+                                        fill="#e8e4de"
+                                      >
+                                        {placedTile.syllables[0].syllable.symbol}
+                                      </text>
+                                    ) : (
+                                      <>
+                                        <text x={slot.center.x} y={slot.center.y - 5} textAnchor="middle" dominantBaseline="central" fontSize="9" fontWeight="bold" fill="#e8e4de">
+                                          {placedTile.syllables[0].syllable.symbol}
+                                        </text>
+                                        <text x={slot.center.x} y={slot.center.y + 5} textAnchor="middle" dominantBaseline="central" fontSize="9" fontWeight="bold" fill="#e8e4de">
+                                          {placedTile.syllables[1].syllable.symbol}
+                                        </text>
+                                      </>
+                                    )}
+                                  </g>
+                                )}
+                              </g>
+                            );
+                          })}
+                        </g>
+                      </svg>
+                    );
+                  })()}
+
                   {/* Item label */}
                   <div
-                    className={`absolute text-xs font-medium bg-white/80 px-1 rounded pointer-events-none ${isContained ? 'text-stone-600 bg-white/70' : 'text-stone-700'}`}
+                    className={`absolute text-xs font-medium px-1 rounded pointer-events-none ${
+                      isContained
+                        ? 'text-stone-600 bg-white/70'
+                        : isTargetItem && isInActionMode
+                          ? 'text-amber-800 bg-amber-100/90'
+                          : isInvestigated
+                            ? 'text-stone-700 bg-white/80'
+                            : 'text-amber-700 bg-amber-50/90'
+                    }`}
                     style={{
                       left: (absolutePosition.x + minX) * INVENTORY_CELL_SIZE + 2,
                       top: (absolutePosition.y + minY) * INVENTORY_CELL_SIZE + 2,
                       zIndex: depth + 1
                     }}
                   >
+                    {!isInvestigated && !isContained && '🔍 '}
                     {matItem.item.name}
+                    {isInvestigated && !isContained && ' ✓'}
                   </div>
+
+                  {/* Action buttons - appear on hover for investigated items */}
+                  {!isInActionMode && !isContained && isInvestigated && hoveredItemId === matItem.id && (
+                    <div
+                      className="absolute flex gap-1 pointer-events-auto"
+                      style={{
+                        left: (absolutePosition.x + minX) * INVENTORY_CELL_SIZE + 2,
+                        top: (absolutePosition.y + minY) * INVENTORY_CELL_SIZE + 18,
+                        zIndex: depth + 100
+                      }}
+                      onMouseEnter={() => setHoveredItemId(matItem.id)}
+                      onMouseLeave={() => setHoveredItemId(null)}
+                    >
+                      {/* Study button - for items with empty slots */}
+                      {getEmptySlotCount(matItem.item) > 0 && (
+                        <button
+                          className="px-2 py-1 text-xs font-medium bg-indigo-600 text-white rounded shadow-lg hover:bg-indigo-700 transition-colors"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startStudying(matItem.id);
+                          }}
+                        >
+                          📚 Study
+                        </button>
+                      )}
+                      {/* Extract button - for items with syllable tiles */}
+                      {hasSyllableTiles(matItem.item) && (
+                        <button
+                          className="px-2 py-1 text-xs font-medium bg-purple-600 text-white rounded shadow-lg hover:bg-purple-700 transition-colors"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startExtracting(matItem.id);
+                          }}
+                        >
+                          ⚗️ Extract
+                        </button>
+                      )}
+                      {/* Destroy button */}
+                      <button
+                        className="px-2 py-1 text-xs font-medium bg-red-600 text-white rounded shadow-lg hover:bg-red-700 transition-colors"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPlacedItems(prev => prev.filter(p => p.id !== matItem.id));
+                          setHoveredItemId(null);
+                        }}
+                      >
+                        🗑️ Destroy
+                      </button>
+                    </div>
+                  )}
                 </React.Fragment>
               );
             })}
@@ -571,9 +1530,10 @@ function InventoryMode() {
                               : p
                           ));
                         } else {
-                          // Place new item from stash into container
+                          // Place new item from stash into container and auto-start investigating
+                          const newItemId = Math.random().toString(36).substr(2, 9);
                           setPlacedItems(prev => [...prev, {
-                            id: Math.random().toString(36).substr(2, 9),
+                            id: newItemId,
                             item: selectedItem,
                             position: null,
                             rotation: relativeRotation,
@@ -581,6 +1541,9 @@ function InventoryMode() {
                             localPosition: containerHover.localPosition
                           }]);
                           setAvailableItems(prev => prev.filter(i => i.id !== selectedItem.id));
+
+                          // Auto-start investigation for newly placed items
+                          dispatch({ type: 'START_INVESTIGATING', itemId: newItemId });
                         }
                         setSelectedItem(null);
                         setIsMovingPlaced(false);
@@ -684,9 +1647,32 @@ function InventoryMode() {
         </div>
       </div>
       
+      {/* Syllable Inventory */}
+      {syllableInventory.length > 0 && (
+        <div className="mt-6 bg-white p-4 rounded-lg shadow-sm border border-stone-200">
+          <h3 className="text-sm font-semibold text-stone-600 mb-2">
+            Collected Syllables ({syllableInventory.length})
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {syllableInventory.map((syl, idx) => (
+              <div
+                key={idx}
+                className="flex items-center gap-1 px-2 py-1 bg-purple-100 text-purple-800 rounded text-sm"
+                title={syl.syllable.name}
+              >
+                <span className="font-bold">{syl.syllable.symbol}</span>
+                <span className="text-xs text-purple-600">{syl.syllable.name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Instructions */}
       <div className="mt-6 text-sm text-stone-500">
-        <p><strong>Controls:</strong> Left-click to select/place • R to rotate • Right-click to return to stash • Esc to cancel</p>
+        <p><strong>Items:</strong> Left-click to select/place • R to rotate • Right-click to return to stash • Esc to cancel</p>
+        <p><strong>Investigation:</strong> Click 🔍 items to investigate • Draw tiles, place them, close all flow lines • Finish to complete</p>
+        <p><strong>Actions:</strong> Hover investigated items for Study/Extract • Extraction flips tiles, collecting syllables</p>
       </div>
     </div>
   );
